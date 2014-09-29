@@ -52,6 +52,7 @@ func (mr *MapReduce) RunMaster() *list.List {
 
   workerGet := make(chan chan string)
   workerPut := make(chan string)
+  workerRm  := make(chan string)
   // worker management
   //   handle worker registration
   //   handle worker request from job managment routine
@@ -74,6 +75,9 @@ func (mr *MapReduce) RunMaster() *list.List {
         fmt.Printf("Worker returned: %s\n", putWorkerName)
         mr.Workers[putWorkerName].busy = false
         queue = TryDispatchWorker(mr, queue)
+      case rmWorkerName := <-workerRm:
+        fmt.Printf("Worker removed: %s\n", rmWorkerName)
+        delete(mr.Workers, rmWorkerName)
       }
     }
   }()
@@ -89,18 +93,25 @@ func (mr *MapReduce) RunMaster() *list.List {
   mapWaitGroup.Add(mr.nMap)
   for mapJobId := 0; mapJobId < mr.nMap; mapJobId++ {
     go func(mapJobId int) {
-      workerRequest := make(chan string)
-      workerGet <- workerRequest    // send request
-      workerName := <-workerRequest // wait for response
-      fmt.Printf("worker get: %s for map job %d\n", workerName, mapJobId)
-      mapJob := CreateDoJobArgs(mr.file, Map, mapJobId, mr.nReduce)
-      reply := &DoJobReply{}
-      call(workerName, "Worker.DoJob", mapJob, reply)
-      if reply.OK {
-        fmt.Printf("Map job %d done successfully!\n", mapJobId)
+      done := false
+      for !done {
+        workerRequest := make(chan string)
+        workerGet <- workerRequest    // send request
+        workerName := <-workerRequest // wait for response
+        fmt.Printf("worker get: %s for map job %d\n", workerName, mapJobId)
+        mapJob := CreateDoJobArgs(mr.file, Map, mapJobId, mr.nReduce)
+        reply := &DoJobReply{}
+        call(workerName, "Worker.DoJob", mapJob, reply)
+        if reply.OK {
+          fmt.Printf("Map job %d done successfully!\n", mapJobId)
+          workerPut <- workerName
+          mapWaitGroup.Done()
+          done = true
+        } else {
+          fmt.Printf("Map job %d fails\n", mapJobId)
+          workerRm <- workerName
+        }
       }
-      workerPut <- workerName
-      mapWaitGroup.Done()
     }(mapJobId)
   }
 
@@ -112,18 +123,25 @@ func (mr *MapReduce) RunMaster() *list.List {
   reduceWaitGroup.Add(mr.nReduce)
   for reduceJobId := 0; reduceJobId < mr.nReduce; reduceJobId++ {
     go func(reduceJobId int) {
-      workerRequest := make(chan string)
-      workerGet <- workerRequest
-      workerName := <- workerRequest
-      fmt.Printf("worker get: %s for reduce job %d\n", workerName, reduceJobId)
-      reduceJob := CreateDoJobArgs(mr.file, Reduce, reduceJobId, mr.nMap)
-      reply := &DoJobReply{}
-      call(workerName, "Worker.DoJob", reduceJob, reply)
-      if reply.OK {
-        fmt.Printf("Reduce job %d done successfully!\n", reduceJobId)
+      done := false
+      for !done {
+        workerRequest := make(chan string)
+        workerGet <- workerRequest
+        workerName := <- workerRequest
+        fmt.Printf("worker get: %s for reduce job %d\n", workerName, reduceJobId)
+        reduceJob := CreateDoJobArgs(mr.file, Reduce, reduceJobId, mr.nMap)
+        reply := &DoJobReply{}
+        call(workerName, "Worker.DoJob", reduceJob, reply)
+        if reply.OK {
+          fmt.Printf("Reduce job %d done successfully!\n", reduceJobId)
+          workerPut <- workerName
+          reduceWaitGroup.Done()
+          done = true
+        } else {
+          fmt.Printf("Reduce job %d fails\n", reduceJobId)
+          workerRm <- workerName
+        }
       }
-      workerPut <- workerName
-      reduceWaitGroup.Done()
     }(reduceJobId)
   }
 
