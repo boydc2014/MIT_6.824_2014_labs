@@ -14,7 +14,7 @@ type PutArgs struct {
   Value string
   DoHash bool // For PutHash
   // You'll have to add definitions here.
-
+  Id int64
   // Field names must start with capital letters,
   // otherwise RPC will break.
 }
@@ -36,6 +36,15 @@ type GetReply struct {
 
 
 // Your RPC definitions here.
+type PutAllArgs struct {
+  Store map[string]string
+  Processed map[int64]bool
+  Results map[int64]string
+}
+
+type PutAllReply struct {
+  Err Err
+}
 
 func hash(s string) uint32 {
   h := fnv.New32a()

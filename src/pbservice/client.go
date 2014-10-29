@@ -5,15 +5,23 @@ import "net/rpc"
 import "fmt"
 
 // You'll probably need to uncomment these:
-// import "time"
-// import "crypto/rand"
-// import "math/big"
+import "time"
+import "crypto/rand"
+import "math/big"
+
+func nrand() int64 {
+  max := big.NewInt(int64(1) << 62)
+  bigx, _ := rand.Int(rand.Reader, max)
+  x := bigx.Int64()
+  return x
+}
 
 
 
 type Clerk struct {
   vs *viewservice.Clerk
   // Your declarations here
+  view viewservice.View
 }
 
 
@@ -59,6 +67,15 @@ func call(srv string, rpcname string,
   return false
 }
 
+
+func (ck *Clerk) updateView() {
+  view, err := ck.vs.Get()
+  if err {
+    //fmt.Printf("FATAL: view service is down\n")
+  }
+  ck.view = view
+}
+
 //
 // fetch a key's value from the current primary;
 // if they key has never been set, return "".
@@ -69,8 +86,29 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
   // Your code here.
-
-  return "???"
+  if (ck.view.Viewnum == 0) {
+    ck.updateView()
+  }
+  if (ck.view.Primary == "") {
+    fmt.Printf("FATAL: client can not get view\n")
+    return ""
+  }
+  
+  success := false
+  args := &GetArgs{key}
+  reply := &GetReply{}
+  for !success {
+    call(ck.view.Primary, "PBServer.Get", args, reply)
+    if reply.Err != OK {
+      //fmt.Printf("WARN: get from %s failed, retry\n", ck.view.Primary)
+      ck.updateView()
+      time.Sleep(time.Second)
+    } else {
+      success = true
+    }
+  }
+  
+  return reply.Value
 }
 
 //
@@ -80,7 +118,33 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
 
   // Your code here.
-  return "???"
+  if (ck.view.Viewnum == 0) {
+    ck.updateView()
+  }
+  if (ck.view.Primary == "") {
+    fmt.Printf("FATAL: client can not get view\n")
+    return ""
+  }
+
+  // keep tring
+  success := false
+  args := &PutArgs{key, value, dohash, nrand()}
+  reply := &PutReply{}
+  for !success {
+    call(ck.view.Primary, "PBServer.Put", args, reply)
+    if reply.Err != OK {
+      fmt.Printf("WARN: put failed, retry\n")
+      // whenever operation fails, update view first
+      ck.updateView()
+      time.Sleep(time.Second)
+    } else {
+      success = true  
+    }
+  }
+  if dohash {
+    return reply.PreviousValue
+  }
+  return ""
 }
 
 func (ck *Clerk) Put(key string, value string) {
