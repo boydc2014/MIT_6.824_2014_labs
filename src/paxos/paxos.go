@@ -28,7 +28,15 @@ import "syscall"
 import "sync"
 import "fmt"
 import "math/rand"
+import "time"
 
+
+type State struct {
+  Np int
+  Na int
+  Va interface{}
+  Decided bool
+}
 
 type Paxos struct {
   mu sync.Mutex
@@ -38,7 +46,7 @@ type Paxos struct {
   rpcCount int
   peers []string
   me int // index into peers[]
-
+  states map[int]*State
 
   // Your data here.
 }
@@ -89,7 +97,205 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
   // Your code here.
+  // using a go routine to return immediately
+  go func() {
+    // while not finished
+    //  generate a proposal number
+    //  call prepare
+    //  if prepared from a majority
+    //    call accept
+    //    if accepted from a majority
+    //      call decide
+    
+    majority := len(px.peers)/2 + 1
+
+    for decided, _ := px.Status(seq); !decided; time.Sleep(time.Millisecond * 100) {
+      // wait for some time before retry to avoid keep preparing
+
+      // Phase 1: Prepare
+      n := px.genProposalNum()
+      pArgs := &PrepareArgs{ Seq:seq, Num:n }
+      pReply := &PrepareReply{ OK:false }
+
+      prepared := 0 // the number of prepared acceptors
+      maxAcceptedNum := 0
+      maxAcceptedVal := v // initial with the start value
+      for _, peer := range px.peers {
+        if call(peer, "Paxos.Prepare", pArgs, pReply) && pReply.OK {
+          prepared++
+          if pReply.Na > maxAcceptedNum {
+            maxAcceptedVal = pReply.Va
+          }
+          fmt.Printf("INFO: prepare OK from %s with reply %s\n", peer, pReply)
+        } else {
+          fmt.Printf("WARN: prepare fails from %s\n", peer)
+        }
+      }
+      if prepared < majority {
+        fmt.Printf("ERROR: prepare phase fails, go to error retry!\n")
+        continue
+      }
+
+      fmt.Printf("INFO: prepare consult result, max accepted (%d, %s)\n", maxAcceptedNum, maxAcceptedVal) 
+
+      // we can not issue our value if we've seen accepted value
+      v = maxAcceptedVal
+
+      // Phase 2: Accept
+      
+      accepted := 0
+      aArgs := &AcceptArgs{ Seq:seq, Na:n, Va:v }
+      aReply := &AcceptReply{ OK:false }
+      for _, peer := range px.peers {
+        if call(peer, "Paxos.Accept", aArgs, aReply) && aReply.OK {
+          accepted++
+          fmt.Printf("INFO: accept OK from %s\n", peer);
+        } else {
+          fmt.Printf("WARN: accept fails from %s\n", peer);
+        }
+      }
+      
+      if accepted < majority {
+        fmt.Printf("ERROR: accept phase fails, go to error retry\n")
+        continue
+      }
+      
+      fmt.Printf("INFO: accept result %d accpeted\n", accepted)
+      // Phase 3: Decide
+      
+      // we do not care decide fails or not, because a value has been decided
+      // we can learn it later even all decide messages were lost 
+      //px.states[seq].Decided = true
+      dArgs := &DecideArgs{ Seq:seq, Va:v}
+      dReply := &DecideReply{ OK:false }
+      nDecided := 0
+      for _, peer := range px.peers {
+        if call(peer, "Paxos.Decide", dArgs, dReply) && dReply.OK {
+          nDecided++
+          fmt.Printf("INFO: decide OK from %s\n", peer)
+        } else {
+          fmt.Printf("WARN: decide fails from %s\n", peer)
+        }
+      }
+
+//error:
+      //fmt.Printf("Wait for a certain time before retry\n")
+      //time.Sleep(time.Millisecond * 100)
+    }
+
+    fmt.Printf("Round finished Seq %s!\n", seq)
+    
+  }()
 }
+
+// util 
+func (px *Paxos) createStateIfNeed(seq int) {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  if _, ok := px.states[seq]; !ok {
+    fmt.Printf("INFO: instance(%d) state does not exist, create\n", seq)
+    px.states[seq] = new(State)
+  }
+}
+
+func (px *Paxos) genProposalNum() int {
+  tmp := (int(time.Now().UnixNano())/int(time.Millisecond)) * 10 + px.me;
+  fmt.Printf("INFO: unique proposal num generated: %d\n", tmp)
+  return tmp
+}
+
+
+type PrepareArgs struct {
+  Seq int
+  Num int
+}
+
+type PrepareReply struct {
+  Na int
+  Va interface {}
+  OK bool
+}
+
+// the prepare handler for an acceptor
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+  px.createStateIfNeed(args.Seq)
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  state := px.states[args.Seq]
+  if args.Num > state.Np {
+    state.Np = args.Num
+    reply.Na = state.Na
+    reply.Va = state.Va
+    reply.OK = true
+  } else {
+    reply.OK = false
+  }
+  return nil
+}
+
+type AcceptArgs struct {
+  Seq int
+  Na int
+  Va interface {}
+}
+
+type AcceptReply struct {
+  OK bool
+}
+
+// the accept handler for an acceptor
+// seq is the instance id
+// n is the proposal id
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+  // we also need ensure state is created here besides at prepare
+  // because an propose call may be lost so state will not be created
+  // at prepare.
+  px.createStateIfNeed(args.Seq)
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  state := px.states[args.Seq]
+  if args.Na >= state.Np {
+    state.Np = args.Na
+    state.Na = args.Na
+    state.Va = args.Va
+    reply.OK = true
+  } else {
+    reply.OK = false
+  }
+  return nil
+}
+
+type DecideArgs struct {
+  Seq int
+  Va interface {}
+}
+
+type DecideReply struct {
+  OK bool
+}
+
+// decide handler
+func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
+  px.createStateIfNeed(args.Seq)
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  
+  // we need to figure out what should an out-dated acceptor handle a 
+  // new decide info. should the acceptor update 
+  state := px.states[args.Seq]
+  state.Va = args.Va
+  state.Decided = true
+
+  reply.OK = true
+  return nil
+}
+
+
 
 //
 // the application on this machine is done with
@@ -108,7 +314,17 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
   // Your code here.
-  return 0
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  
+  max := -1
+  for seq, _ := range px.states {
+    if seq > max {
+      max = seq
+    }
+  }
+
+  return max
 }
 
 //
@@ -153,7 +369,20 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
   // Your code here.
-  return false, nil
+  fmt.Printf("INFO: check status for %d at %s\n", seq, px.me)
+  px.createStateIfNeed(seq);
+  
+
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  
+  decided := px.states[seq].Decided
+  value := px.states[seq].Va
+  if !decided {
+    value = nil
+  }
+  
+  return decided, value
 }
 
 
@@ -178,6 +407,7 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
   px := &Paxos{}
   px.peers = peers
   px.me = me
+  px.states = make(map[int]*State)
 
 
   // Your initialization code here.
