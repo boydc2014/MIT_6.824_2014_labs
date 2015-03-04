@@ -109,8 +109,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
     
     majority := len(px.peers)/2 + 1
 
-    for decided, _ := px.Status(seq); !decided; time.Sleep(time.Millisecond * 100) {
-      // wait for some time before retry to avoid keep preparing
+    for !px.IsDecided(seq) {
 
       // Phase 1: Prepare
       n := px.genProposalNum()
@@ -121,9 +120,10 @@ func (px *Paxos) Start(seq int, v interface{}) {
       maxAcceptedNum := 0
       maxAcceptedVal := v // initial with the start value
       for _, peer := range px.peers {
-        if call(peer, "Paxos.Prepare", pArgs, pReply) && pReply.OK {
+        if px.CallPrepare(peer, pArgs, pReply) && pReply.OK {
           prepared++
           if pReply.Na > maxAcceptedNum {
+            maxAcceptedNum = pReply.Na
             maxAcceptedVal = pReply.Va
           }
           fmt.Printf("INFO: prepare OK from %s with reply %s\n", peer, pReply)
@@ -147,7 +147,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
       aArgs := &AcceptArgs{ Seq:seq, Na:n, Va:v }
       aReply := &AcceptReply{ OK:false }
       for _, peer := range px.peers {
-        if call(peer, "Paxos.Accept", aArgs, aReply) && aReply.OK {
+        if px.CallAccept(peer, aArgs, aReply) && aReply.OK {
           accepted++
           fmt.Printf("INFO: accept OK from %s\n", peer);
         } else {
@@ -170,7 +170,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
       dReply := &DecideReply{ OK:false }
       nDecided := 0
       for _, peer := range px.peers {
-        if call(peer, "Paxos.Decide", dArgs, dReply) && dReply.OK {
+        if px.CallDecide(peer, dArgs, dReply) && dReply.OK {
           nDecided++
           fmt.Printf("INFO: decide OK from %s\n", peer)
         } else {
@@ -178,14 +178,20 @@ func (px *Paxos) Start(seq int, v interface{}) {
         }
       }
 
-//error:
-      //fmt.Printf("Wait for a certain time before retry\n")
-      //time.Sleep(time.Millisecond * 100)
+      // failure-retry after a certain time
+      if !px.IsDecided(seq) {
+        time.Sleep(time.Millisecond * 100);
+      }
     }
 
     fmt.Printf("Round finished Seq %s!\n", seq)
     
   }()
+}
+
+func (px *Paxos) IsDecided(seq int) bool {
+  decided, _ := px.Status(seq)
+  return decided
 }
 
 // util 
@@ -216,6 +222,35 @@ type PrepareReply struct {
   OK bool
 }
 
+
+func (px *Paxos) IsMe(peer string) bool{
+  return px.peers[px.me] == peer
+}
+// caller of prepare, use function call instead of rpc locally
+func (px *Paxos) CallPrepare(peer string, args *PrepareArgs, reply *PrepareReply) bool {
+  if px.IsMe(peer) {
+    fmt.Printf("call prepare locally\n")
+    px.Prepare(args, reply)
+    return true
+  }
+  return call(peer, "Paxos.Prepare", args, reply)
+}
+
+func (px *Paxos) CallAccept(peer string, args *AcceptArgs, reply *AcceptReply) bool {
+  if px.IsMe(peer) {
+    px.Accept(args, reply)
+    return true
+  }
+  return call(peer, "Paxos.Accept", args, reply)
+}
+
+func (px *Paxos) CallDecide(peer string, args *DecideArgs, reply *DecideReply) bool {
+  if px.IsMe(peer) {
+    px.Decide(args, reply)
+    return true
+  }
+  return call(peer, "Paxos.Decide", args, reply)
+}
 // the prepare handler for an acceptor
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
   px.createStateIfNeed(args.Seq)
