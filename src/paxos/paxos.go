@@ -45,11 +45,14 @@ type Paxos struct {
   unreliable bool
   rpcCount int
   peers []string
+  dones []int
   me int // index into peers[]
   states map[int]*State
+  MinSeq int
 
   // Your data here.
 }
+
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -98,6 +101,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 func (px *Paxos) Start(seq int, v interface{}) {
   // Your code here.
   // using a go routine to return immediately
+
   go func() {
     // while not finished
     //  generate a proposal number
@@ -109,84 +113,124 @@ func (px *Paxos) Start(seq int, v interface{}) {
     
     majority := len(px.peers)/2 + 1
 
-    for !px.IsDecided(seq) {
+    for px.CanStart(seq) {
 
       // Phase 1: Prepare
+      fmt.Printf("[peer:%d seq:%d] prepare Start with value %v\n", px.me, seq, v)
       n := px.genProposalNum()
-      pArgs := &PrepareArgs{ Seq:seq, Num:n }
-      pReply := &PrepareReply{ OK:false }
+      px.mu.Lock()
+      pArgs := &PrepareArgs{ Seq:seq, Num:n, Done:px.dones[px.me] }
+      px.mu.Unlock()
+      pReply := &PrepareReply{ }
 
       prepared := 0 // the number of prepared acceptors
       maxAcceptedNum := 0
       maxAcceptedVal := v // initial with the start value
-      for _, peer := range px.peers {
+      for id, peer := range px.peers {
+
         if px.CallPrepare(peer, pArgs, pReply) && pReply.OK {
           prepared++
           if pReply.Na > maxAcceptedNum {
             maxAcceptedNum = pReply.Na
             maxAcceptedVal = pReply.Va
           }
-          fmt.Printf("INFO: prepare OK from %s with reply %s\n", peer, pReply)
+          fmt.Printf("[peer:%d seq:%d] prepare OK from (%d)%s reply %+v\n", px.me, seq, id, peer, pReply)
         } else {
-          fmt.Printf("WARN: prepare fails from %s\n", peer)
+          fmt.Printf("[peer:%d seq:%d] prepare fails from (%d)%s\n", px.me, seq, id, peer)
         }
+
+        px.UpdateDone(pReply.Done, id)
       }
       if prepared < majority {
-        fmt.Printf("ERROR: prepare phase fails, go to error retry!\n")
+        fmt.Printf("[peer:%d seq:%d] ERROR: prepare phase fails, go to error retry!\n", px.me, seq)
+        time.Sleep(time.Millisecond * 100)
         continue
       }
 
-      fmt.Printf("INFO: prepare consult result, max accepted (%d, %s)\n", maxAcceptedNum, maxAcceptedVal) 
+      //fmt.Printf("[%d]INFO: prepare consult result, max accepted (%d, %s)\n", px.me, maxAcceptedNum, maxAcceptedVal) 
 
       // we can not issue our value if we've seen accepted value
       v = maxAcceptedVal
 
       // Phase 2: Accept
+      fmt.Printf("[peer:%d seq:%d] accept Start with value %v\n", px.me, seq, v)
       
       accepted := 0
-      aArgs := &AcceptArgs{ Seq:seq, Na:n, Va:v }
+      px.mu.Lock()
+      aArgs := &AcceptArgs{ Seq:seq, Na:n, Va:v, Done:px.dones[px.me] }
+      fmt.Printf("[peer:%d seq:%d] accept Args sent: %+v\n", px.me, seq, aArgs.Na)
+      px.mu.Unlock()
       aReply := &AcceptReply{ OK:false }
-      for _, peer := range px.peers {
+      for id, peer := range px.peers {
         if px.CallAccept(peer, aArgs, aReply) && aReply.OK {
           accepted++
-          fmt.Printf("INFO: accept OK from %s\n", peer);
+          fmt.Printf("[peer:%d seq:%d] accept OK from (%d)%s with reply %+v\n", px.me, seq, id, peer, aReply);
         } else {
-          fmt.Printf("WARN: accept fails from %s\n", peer);
+          fmt.Printf("[peer:%d seq:%d] WARN: accept fails from (%d)%s\n", px.me, seq, id, peer);
         }
+
+        px.UpdateDone(aReply.Done, id)
       }
       
       if accepted < majority {
-        fmt.Printf("ERROR: accept phase fails, go to error retry\n")
+        fmt.Printf("[peer:%d seq:%d] ERROR: accept phase fails, go to error retry\n", px.me, seq)
+        time.Sleep(time.Millisecond * 100)
         continue
       }
       
-      fmt.Printf("INFO: accept result %d accpeted\n", accepted)
+      fmt.Printf("[peer:%d seq:%d] INFO: accept result %d accpeted\n", px.me, seq, accepted)
+
       // Phase 3: Decide
+  
+      fmt.Printf("[peer:%d seq:%d] decide Start\n", px.me, seq)
       
       // we do not care decide fails or not, because a value has been decided
       // we can learn it later even all decide messages were lost 
-      //px.states[seq].Decided = true
-      dArgs := &DecideArgs{ Seq:seq, Va:v}
+      px.mu.Lock()
+      dArgs := &DecideArgs{ Seq:seq, Va:v, Done:px.dones[px.me] }
+      px.mu.Unlock()
       dReply := &DecideReply{ OK:false }
       nDecided := 0
-      for _, peer := range px.peers {
+      for id, peer := range px.peers {
         if px.CallDecide(peer, dArgs, dReply) && dReply.OK {
           nDecided++
-          fmt.Printf("INFO: decide OK from %s\n", peer)
+          fmt.Printf("[peer:%d seq:%d] decide OK from (%d)%s with reply %+v\n", px.me, seq, id, peer, dReply)
         } else {
-          fmt.Printf("WARN: decide fails from %s\n", peer)
+          fmt.Printf("[peer:%d seq:%d] WARN: decide fails from (%d)%s\n", px.me, seq, id, peer)
         }
+        px.UpdateDone(dReply.Done, id)
       }
 
       // failure-retry after a certain time
-      if !px.IsDecided(seq) {
-        time.Sleep(time.Millisecond * 100);
-      }
+      //if !px.IsDecided(seq) {
+      //  time.Sleep(time.Millisecond * 100);
+      //}
+
     }
 
-    fmt.Printf("Round finished Seq %s!\n", seq)
+    fmt.Printf("[peer:%d seq:%d] Round finished\n", px.me, seq)
     
   }()
+}
+
+func (px *Paxos) CanStart(seq int) bool {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  // check Min first
+  if seq < px.MinSeq {
+    fmt.Printf("[peer:%d] start fail seq %d < min %d\n", px.me, seq, px.MinSeq)
+    return false
+  }
+  
+  // check decided directly from px instead of Status()
+  // avoid creating a new state
+  if _, ok := px.states[seq]; ok && px.states[seq].Decided {
+    return false
+  }
+  
+  // otherwise it can start
+  return true
 }
 
 func (px *Paxos) IsDecided(seq int) bool {
@@ -195,18 +239,20 @@ func (px *Paxos) IsDecided(seq int) bool {
 }
 
 // util 
+
+
+// create a state to track a paxos instance with seq num: seq
+// must called with px.mu Lock
 func (px *Paxos) createStateIfNeed(seq int) {
-  px.mu.Lock()
-  defer px.mu.Unlock()
   if _, ok := px.states[seq]; !ok {
-    fmt.Printf("INFO: instance(%d) state does not exist, create\n", seq)
+    fmt.Printf("[peer:%d seq:%d] create state \n", px.me, seq)
     px.states[seq] = new(State)
   }
 }
 
 func (px *Paxos) genProposalNum() int {
   tmp := (int(time.Now().UnixNano())/int(time.Millisecond)) * 10 + px.me;
-  fmt.Printf("INFO: unique proposal num generated: %d\n", tmp)
+  //fmt.Printf("[%d]INFO: unique proposal num generated: %d\n", px.me, tmp)
   return tmp
 }
 
@@ -214,12 +260,14 @@ func (px *Paxos) genProposalNum() int {
 type PrepareArgs struct {
   Seq int
   Num int
+  Done int
 }
 
 type PrepareReply struct {
   Na int
   Va interface {}
   OK bool
+  Done int
 }
 
 
@@ -229,7 +277,7 @@ func (px *Paxos) IsMe(peer string) bool{
 // caller of prepare, use function call instead of rpc locally
 func (px *Paxos) CallPrepare(peer string, args *PrepareArgs, reply *PrepareReply) bool {
   if px.IsMe(peer) {
-    fmt.Printf("call prepare locally\n")
+    //fmt.Printf("call prepare locally\n")
     px.Prepare(args, reply)
     return true
   }
@@ -253,10 +301,17 @@ func (px *Paxos) CallDecide(peer string, args *DecideArgs, reply *DecideReply) b
 }
 // the prepare handler for an acceptor
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
-  px.createStateIfNeed(args.Seq)
-
   px.mu.Lock()
   defer px.mu.Unlock()
+
+  if args.Seq < px.MinSeq {
+    fmt.Println("[peer:%d seq:%d] prepare fail seq %d < min %d\n", px.me, args.Seq, args.Seq, px.MinSeq)
+    reply.OK = false
+    reply.Done = px.dones[px.me]
+    return nil
+  }
+
+  px.createStateIfNeed(args.Seq)
 
   state := px.states[args.Seq]
   if args.Num > state.Np {
@@ -267,6 +322,12 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
   } else {
     reply.OK = false
   }
+  reply.Done = px.dones[px.me]
+  fmt.Printf("[peer:%d seq:%d] prepare result: %+v reply: %+v state: %+v\n", px.me, args.Seq, args, reply, state)
+  //if px.me == 0 {
+  //  reply.Done = 100
+  //}
+  //fmt.Printf("[%d]INFO, dones array %d Done %d passed in Done %d pass out\n", px.me, px.dones, args.Done, reply.Done)
   return nil
 }
 
@@ -274,9 +335,11 @@ type AcceptArgs struct {
   Seq int
   Na int
   Va interface {}
+  Done int
 }
 
 type AcceptReply struct {
+  Done int
   OK bool
 }
 
@@ -284,13 +347,21 @@ type AcceptReply struct {
 // seq is the instance id
 // n is the proposal id
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+
+  if args.Seq < px.MinSeq {
+    fmt.Println("[peer:%d seq:%d] accept fail seq %d < min %d\n", px.me, args.Seq, args.Seq, px.MinSeq)
+    reply.OK = false
+    reply.Done = px.dones[px.me]
+    return nil
+  }
+
+  fmt.Printf("[peer:%d seq:%d] accept args received: %+v\n", px.me, args.Seq, args)
   // we also need ensure state is created here besides at prepare
   // because an propose call may be lost so state will not be created
   // at prepare.
   px.createStateIfNeed(args.Seq)
-
-  px.mu.Lock()
-  defer px.mu.Unlock()
 
   state := px.states[args.Seq]
   if args.Na >= state.Np {
@@ -301,24 +372,35 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
   } else {
     reply.OK = false
   }
+  reply.Done = px.dones[px.me]
   return nil
 }
 
 type DecideArgs struct {
   Seq int
   Va interface {}
+  Done int
 }
 
 type DecideReply struct {
   OK bool
+  Done int
 }
 
 // decide handler
 func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
-  px.createStateIfNeed(args.Seq)
-
   px.mu.Lock()
   defer px.mu.Unlock()
+
+  if args.Seq < px.MinSeq {
+    fmt.Printf("[peer:%d seq:%d] decide fail seq %d < min %d\n", px.me, args.Seq, args.Seq, px.MinSeq)
+    reply.OK = false
+    reply.Done = px.dones[px.me]
+    return nil
+  }
+
+  fmt.Printf("[peer:%d] handle decide with arg %+v\n", px.me, args)
+  px.createStateIfNeed(args.Seq)
   
   // we need to figure out what should an out-dated acceptor handle a 
   // new decide info. should the acceptor update 
@@ -327,6 +409,7 @@ func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
   state.Decided = true
 
   reply.OK = true
+  reply.Done = px.dones[px.me]
   return nil
 }
 
@@ -339,7 +422,48 @@ func (px *Paxos) Decide(args *DecideArgs, reply *DecideReply) error {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-  // Your code here.
+  // update Done
+  px.UpdateDone(seq, px.me)
+}
+
+// update Done value for a specified peer 
+func (px *Paxos) UpdateDone(seq int, id int) {
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  if seq < 0 {
+    return
+  }
+  fmt.Printf("[peer:%d] update, peer %d done %d\n", px.me, id, seq)
+  px.dones[id] = seq
+  // triger a drop here
+  min := px.dones[0]
+  for _, done := range px.dones {
+    if done < min {
+      min = done
+    }
+  }
+  if min < 0 {
+    // can not update Min since there is some done value = -1
+    px.MinSeq = -1
+  } else {
+    px.MinSeq = min+1
+    fmt.Printf("[peer:%d] update Min %d\n", px.me, px.MinSeq)
+  }
+
+  // drop the values 
+  toDrop := make([]int, 0)
+  for seq, _ := range px.states {
+    if seq < px.MinSeq {
+      toDrop = append(toDrop, seq)
+    }
+  }
+  if len(toDrop) > 0 {
+    fmt.Printf("[peer:%d] seqs need to be droped %v\n", px.me, toDrop)
+  }
+
+  for _, seq := range toDrop {
+    delete(px.states, seq)
+  }
 }
 
 //
@@ -392,7 +516,12 @@ func (px *Paxos) Max() int {
 // 
 func (px *Paxos) Min() int {
   // You code here.
-  return 0
+  px.mu.Lock()
+  defer px.mu.Unlock()
+  if px.MinSeq < 0 {
+    return 0
+  }
+  return px.MinSeq
 }
 
 //
@@ -403,13 +532,12 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (bool, interface{}) {
-  // Your code here.
-  fmt.Printf("INFO: check status for %d at %s\n", seq, px.me)
-  px.createStateIfNeed(seq);
-  
-
   px.mu.Lock()
   defer px.mu.Unlock()
+
+  fmt.Printf("[peer:%d seq:%d] check status\n", px.me, seq)
+  px.createStateIfNeed(seq);
+
   
   decided := px.states[seq].Decided
   value := px.states[seq].Va
@@ -441,8 +569,13 @@ func (px *Paxos) Kill() {
 func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
   px := &Paxos{}
   px.peers = peers
+  px.dones = make([]int, len(px.peers))
+  for index, _ := range px.dones {
+    px.dones[index] = -1 // init to -1 for all peers
+  }
   px.me = me
   px.states = make(map[int]*State)
+  px.MinSeq = -1
 
 
   // Your initialization code here.
