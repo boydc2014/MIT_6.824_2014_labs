@@ -121,12 +121,12 @@ func (px *Paxos) Start(seq int, v interface{}) {
       px.mu.Lock()
       pArgs := &PrepareArgs{ Seq:seq, Num:n, Done:px.dones[px.me] }
       px.mu.Unlock()
-      pReply := &PrepareReply{ }
 
       prepared := 0 // the number of prepared acceptors
       maxAcceptedNum := 0
       maxAcceptedVal := v // initial with the start value
       for id, peer := range px.peers {
+        pReply := &PrepareReply{ }
 
         if px.CallPrepare(peer, pArgs, pReply) && pReply.OK {
           prepared++
@@ -160,8 +160,8 @@ func (px *Paxos) Start(seq int, v interface{}) {
       aArgs := &AcceptArgs{ Seq:seq, Na:n, Va:v, Done:px.dones[px.me] }
       fmt.Printf("[peer:%d seq:%d] accept Args sent: %+v\n", px.me, seq, aArgs.Na)
       px.mu.Unlock()
-      aReply := &AcceptReply{ OK:false }
       for id, peer := range px.peers {
+        aReply := &AcceptReply{ OK:false }
         if px.CallAccept(peer, aArgs, aReply) && aReply.OK {
           accepted++
           fmt.Printf("[peer:%d seq:%d] accept OK from (%d)%s with reply %+v\n", px.me, seq, id, peer, aReply);
@@ -189,9 +189,10 @@ func (px *Paxos) Start(seq int, v interface{}) {
       px.mu.Lock()
       dArgs := &DecideArgs{ Seq:seq, Va:v, Done:px.dones[px.me] }
       px.mu.Unlock()
-      dReply := &DecideReply{ OK:false }
+
       nDecided := 0
       for id, peer := range px.peers {
+        dReply := &DecideReply{ OK:false }
         if px.CallDecide(peer, dArgs, dReply) && dReply.OK {
           nDecided++
           fmt.Printf("[peer:%d seq:%d] decide OK from (%d)%s with reply %+v\n", px.me, seq, id, peer, dReply)
